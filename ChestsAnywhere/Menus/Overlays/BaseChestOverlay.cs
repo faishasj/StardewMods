@@ -30,6 +30,8 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
     ** Constants
     ****/
     private const int EditButtonId = 1_200_000;
+    private const int ChestDropdownId = EditButtonId + 10;
+    private const int CategoryDropdownId = EditButtonId + 11;
     private const int EditNameFieldId = EditButtonId + 1;
     private const int EditCategoryFieldId = EditButtonId + 2;
     private const int EditOrderFieldId = EditButtonId + 3;
@@ -111,11 +113,11 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
     /// <summary>The edit button.</summary>
     protected ClickableTextureComponent EditButton;
 
-    /// <summary>The underlying menu component linked to the edit button for controller navigation.</summary>
-    private ClickableComponent? EditButtonAnchor;
+    /// <summary>The original upward neighbor IDs for menu components linked to the overlay's top navigation row.</summary>
+    private readonly Dictionary<ClickableComponent, int> OriginalUpNeighborIds = [];
 
-    /// <summary>The anchor's original upward neighbor ID.</summary>
-    private int EditButtonAnchorOriginalUpId;
+    /// <summary>The original downward neighbor IDs for menu components linked to the overlay's top navigation row.</summary>
+    private readonly Dictionary<ClickableComponent, int> OriginalDownNeighborIds = [];
 
     /// <summary>Whether the controller component graph needs to be rebuilt after drawing.</summary>
     private bool ControllerFlowNeedsRefresh = true;
@@ -199,8 +201,9 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
         get;
         protected set
         {
+            Element previous = field;
             field = value;
-            this.OnActiveElementChanged(value);
+            this.OnActiveElementChanged(previous, value);
         }
     }
 
@@ -407,6 +410,12 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
         if (!this.IsInitialized)
             return;
 
+        if (e.Pressed.Contains(SButton.ControllerA) && this.TryActivateSnappedControllerComponent())
+        {
+            this.InputHelper.Suppress(SButton.ControllerA);
+            return;
+        }
+
         // check for textbox focus
         bool anyTextboxSelected = Game1.game1.HasKeyboardFocus() && Game1.game1.instanceKeyboardDispatcher?.Subscriber != null;
 
@@ -455,6 +464,8 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
                     this.SuppressAll(e.Pressed);
                     break;
                 }
+                if (this.ActiveElement == Element.EditForm && e.Pressed.Any(this.IsControllerDirection))
+                    this.DeselectManagedTextboxes();
 
                 // always suppress in this context, since we'll handle text input ourselves
                 if (e.Pressed.Any())
@@ -470,7 +481,7 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
                     }
 
                     IEnumerable<SButton> buttonsToSuppress = e.Pressed.Except(this.PasteModifierKeys);
-                    if (this.ActiveElement == Element.EditForm)
+                    if (this.ActiveElement is Element.ChestList or Element.CategoryList or Element.EditForm)
                         buttonsToSuppress = buttonsToSuppress.Except(this.ControllerNavigationButtons);
 
                     this.SuppressAll(buttonsToSuppress);
@@ -706,6 +717,8 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
         if (this.Categories.Length > 1)
         {
             this.CategoryDropdown = new Dropdown<string>(bounds.Right - Game1.tileSize, bounds.Y, this.Font, this.SelectedCategory, this.Categories, category => category, maxDropdownLabelWidth);
+            this.CategoryDropdown.myID = CategoryDropdownId;
+            this.CategoryDropdown.ScreenReaderText = I18n.Label_Category();
 
             if (Constants.TargetPlatform != GamePlatform.Android)
                 this.CategoryDropdown.bounds.Y = bounds.Y - this.CategoryDropdown.bounds.Height + topOffset;
@@ -721,6 +734,8 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
             {
                 ManagedChest? selected = ChestFactory.GetBestMatch(chests, this.Chest);
                 this.ChestDropdown = new Dropdown<ManagedChest>(bounds.X, bounds.Y, this.Font, selected, chests, chest => chest.DisplayName, maxDropdownLabelWidth);
+                this.ChestDropdown.myID = ChestDropdownId;
+                this.ChestDropdown.ScreenReaderText = I18n.Label_Name();
 
                 if (Constants.TargetPlatform != GamePlatform.Android)
                 {
@@ -865,8 +880,9 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
     }
 
     /// <summary>Handle the active element changing.</summary>
+    /// <param name="previous">The previous value.</param>
     /// <param name="value">The new value.</param>
-    private void OnActiveElementChanged(Element value)
+    private void OnActiveElementChanged(Element previous, Element value)
     {
         // disable readonly mode
         this.SetItemsClickable(value == Element.Menu);
@@ -885,9 +901,15 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
             this.DeselectManagedTextboxes();
 
         this.ControllerFlowNeedsRefresh = true;
-        this.PendingControllerFocus = value == Element.EditForm
-            ? this.EditNameFieldArea
-            : this.EditButton;
+        this.PendingControllerFocus = value switch
+        {
+            Element.EditForm => this.EditNameFieldArea,
+            Element.ChestList => this.ChestDropdown,
+            Element.CategoryList => this.CategoryDropdown,
+            Element.Menu when previous == Element.ChestList => this.ChestDropdown,
+            Element.Menu when previous == Element.CategoryList => this.CategoryDropdown,
+            _ => this.EditButton
+        };
     }
 
     /// <summary>Exit the chest menu.</summary>
@@ -1024,7 +1046,7 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
         if (!this.ControllerFlowNeedsRefresh && expectedComponentPresent)
             return;
 
-        this.RestoreEditButtonAnchor();
+        this.RestoreMenuControllerFlow();
         this.ControllerComponents.Clear();
 
         if (this.ActiveElement == Element.EditForm)
@@ -1042,36 +1064,109 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
         this.ControllerFlowNeedsRefresh = false;
     }
 
-    /// <summary>Add the edit button to the underlying menu's controller graph.</summary>
+    /// <summary>Add the chest, edit, and category controls to the underlying menu's controller graph.</summary>
     private void InstallMenuControllerFlow()
     {
         this.Menu.populateClickableComponentList();
         this.Menu.allClickableComponents ??= [];
 
-        Point editCenter = this.EditButton.bounds.Center;
-        this.EditButtonAnchor = this.Menu.allClickableComponents
-            .Where(component => component.myID >= 0 && component != this.EditButton)
-            .OrderBy(component =>
-            {
-                Point center = component.bounds.Center;
-                int abovePenalty = center.Y < editCenter.Y ? 1_000_000 : 0;
-                return abovePenalty + Math.Abs(center.X - editCenter.X) + Math.Abs(center.Y - editCenter.Y);
-            })
-            .FirstOrDefault();
+        List<ClickableComponent> topRow = [];
+        if (this.ChestDropdown != null)
+            topRow.Add(this.ChestDropdown);
+        topRow.Add(this.EditButton);
+        if (this.CategoryDropdown != null)
+            topRow.Add(this.CategoryDropdown);
+        topRow.Sort((left, right) => left.bounds.Center.X.CompareTo(right.bounds.Center.X));
 
-        this.EditButton.upNeighborID = -1;
-        this.EditButton.leftNeighborID = -1;
-        this.EditButton.rightNeighborID = -1;
-        this.EditButton.downNeighborID = this.EditButtonAnchor?.myID ?? -1;
-
-        if (this.EditButtonAnchor != null)
+        List<ClickableComponent> inventoryTopRow = this.GetInventoryTopRow();
+        List<ClickableComponent> colorPickerBottomRow = this.GetColorPickerBottomRow();
+        for (int i = 0; i < topRow.Count; i++)
         {
-            this.EditButtonAnchorOriginalUpId = this.EditButtonAnchor.upNeighborID;
-            this.EditButtonAnchor.upNeighborID = EditButtonId;
+            ClickableComponent component = topRow[i];
+            component.leftNeighborID = i > 0 ? topRow[i - 1].myID : -1;
+            component.rightNeighborID = i + 1 < topRow.Count ? topRow[i + 1].myID : -1;
+            component.upNeighborID = this.FindClosestByX(component, colorPickerBottomRow)?.myID ?? -1;
+
+            bool isExpandedDropdown = component is Dropdown<ManagedChest> { IsExpanded: true }
+                || component is Dropdown<string> { IsExpanded: true };
+            if (!isExpandedDropdown)
+                component.downNeighborID = this.FindClosestByX(component, inventoryTopRow)?.myID ?? -1;
         }
 
-        this.ControllerComponents.Add(this.EditButton);
-        this.Menu.allClickableComponents.Add(this.EditButton);
+        foreach (ClickableComponent inventoryComponent in inventoryTopRow)
+        {
+            this.OriginalUpNeighborIds[inventoryComponent] = inventoryComponent.upNeighborID;
+            inventoryComponent.upNeighborID = this.FindClosestByX(inventoryComponent, topRow)?.myID ?? inventoryComponent.upNeighborID;
+        }
+
+        foreach (ClickableComponent colorComponent in colorPickerBottomRow)
+        {
+            this.OriginalDownNeighborIds[colorComponent] = colorComponent.downNeighborID;
+            colorComponent.downNeighborID = this.FindClosestByX(colorComponent, topRow)?.myID ?? colorComponent.downNeighborID;
+        }
+
+        this.ControllerComponents.AddRange(topRow);
+        this.Menu.allClickableComponents.AddRange(topRow);
+
+        Dropdown<ManagedChest>? expandedChestDropdown = this.ChestDropdown is { IsExpanded: true }
+            ? this.ChestDropdown
+            : null;
+        Dropdown<string>? expandedCategoryDropdown = this.CategoryDropdown is { IsExpanded: true }
+            ? this.CategoryDropdown
+            : null;
+        IEnumerable<ClickableComponent>? dropdownChildren = expandedChestDropdown?.GetChildComponents()
+            ?? expandedCategoryDropdown?.GetChildComponents();
+        ClickableComponent? expandedDropdown = expandedChestDropdown ?? (ClickableComponent?)expandedCategoryDropdown;
+        if (dropdownChildren != null && expandedDropdown != null)
+        {
+            List<ClickableComponent> children = dropdownChildren.ToList();
+            ClickableComponent? topChild = children.FirstOrDefault(child => child.myID == expandedDropdown.downNeighborID);
+            if (topChild != null)
+                topChild.upNeighborID = expandedDropdown.myID;
+
+            this.ControllerComponents.AddRange(children);
+            this.Menu.allClickableComponents.AddRange(children);
+        }
+    }
+
+    /// <summary>Get the top row of the chest inventory for linking to the overlay controls.</summary>
+    private List<ClickableComponent> GetInventoryTopRow()
+    {
+        IEnumerable<ClickableComponent> candidates = this.Menu is ItemGrabMenu itemGrabMenu
+            ? itemGrabMenu.ItemsToGrabMenu.inventory
+            : this.Menu.allClickableComponents.Where(component =>
+            {
+                Point center = component.bounds.Center;
+                return component.myID >= 0
+                    && center.X >= this.Menu.xPositionOnScreen
+                    && center.X <= this.Menu.xPositionOnScreen + this.Menu.width
+                    && center.Y > this.EditButton.bounds.Bottom;
+            });
+
+        int? topY = candidates.Select(component => (int?)component.bounds.Y).Min();
+        return topY.HasValue
+            ? candidates.Where(component => component.bounds.Y == topY.Value).OrderBy(component => component.bounds.X).ToList()
+            : [];
+    }
+
+    /// <summary>Get the bottom row of the chest color picker, if shown.</summary>
+    private List<ClickableComponent> GetColorPickerBottomRow()
+    {
+        if (this.Menu is not ItemGrabMenu { chestColorPicker.visible: true } itemGrabMenu)
+            return [];
+
+        IEnumerable<ClickableComponent> candidates = itemGrabMenu.discreteColorPickerCC
+            .Where(component => component.visible && component.myID >= 0);
+        int? bottomY = candidates.Select(component => (int?)component.bounds.Y).Max();
+        return bottomY.HasValue
+            ? candidates.Where(component => component.bounds.Y == bottomY.Value).OrderBy(component => component.bounds.X).ToList()
+            : [];
+    }
+
+    /// <summary>Find the component whose horizontal center is nearest to the source component.</summary>
+    private ClickableComponent? FindClosestByX(ClickableComponent source, IEnumerable<ClickableComponent> candidates)
+    {
+        return candidates.MinBy(component => Math.Abs(component.bounds.Center.X - source.bounds.Center.X));
     }
 
     /// <summary>Replace the underlying menu's controller graph with the edit form controls.</summary>
@@ -1138,7 +1233,7 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
     /// <summary>Remove controller components injected into the underlying menu.</summary>
     private void RemoveControllerComponents()
     {
-        this.RestoreEditButtonAnchor();
+        this.RestoreMenuControllerFlow();
 
         if (this.Menu.allClickableComponents != null)
         {
@@ -1149,14 +1244,41 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
         this.ControllerComponents.Clear();
     }
 
-    /// <summary>Restore the menu component linked to the edit button.</summary>
-    private void RestoreEditButtonAnchor()
+    /// <summary>Restore menu components changed to link to the overlay controls.</summary>
+    private void RestoreMenuControllerFlow()
     {
-        if (this.EditButtonAnchor != null)
-        {
-            this.EditButtonAnchor.upNeighborID = this.EditButtonAnchorOriginalUpId;
-            this.EditButtonAnchor = null;
-        }
+        foreach ((ClickableComponent component, int upNeighborId) in this.OriginalUpNeighborIds)
+            component.upNeighborID = upNeighborId;
+        foreach ((ClickableComponent component, int downNeighborId) in this.OriginalDownNeighborIds)
+            component.downNeighborID = downNeighborId;
+
+        this.OriginalUpNeighborIds.Clear();
+        this.OriginalDownNeighborIds.Clear();
+    }
+
+    /// <summary>Activate the overlay component currently selected by controller navigation.</summary>
+    private bool TryActivateSnappedControllerComponent()
+    {
+        ClickableComponent? component = this.Menu.currentlySnappedComponent;
+        if (component == null || !this.ControllerComponents.Contains(component))
+            return false;
+
+        Point center = component.bounds.Center;
+        return this.ReceiveLeftClick(center.X, center.Y);
+    }
+
+    /// <summary>Get whether a button is directional controller input.</summary>
+    private bool IsControllerDirection(SButton button)
+    {
+        return button is
+            SButton.DPadUp
+            or SButton.DPadDown
+            or SButton.DPadLeft
+            or SButton.DPadRight
+            or SButton.LeftThumbstickUp
+            or SButton.LeftThumbstickDown
+            or SButton.LeftThumbstickLeft
+            or SButton.LeftThumbstickRight;
     }
 
     /// <summary>Handle directional controller input for an expanded edit-form dropdown.</summary>
