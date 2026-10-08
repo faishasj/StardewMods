@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using StardewModdingAPI;
+using StardewValley;
 using StardewValley.Menus;
 
 namespace Pathoschild.Stardew.ChestsAnywhere.Menus.Components;
@@ -110,6 +111,24 @@ internal class SimpleDropdown<TKey>
 
         // select item in dropdown or close
         this.Dropdown.leftClickReleased(x, y);
+        return true;
+    }
+
+    /// <summary>Move the selected option while the dropdown is expanded.</summary>
+    /// <param name="offset">The number of options to move.</param>
+    /// <returns>Returns whether the input was handled.</returns>
+    public bool TryMoveSelection(int offset)
+    {
+        if (!this.IsExpanded)
+            return false;
+
+        int newIndex = Math.Clamp(this.Dropdown.selectedOption + offset, 0, this.Options.Count - 1);
+        if (newIndex != this.Dropdown.selectedOption)
+        {
+            this.Dropdown.selectedOption = newIndex;
+            Game1.playSound("shiny4");
+        }
+
         return true;
     }
 

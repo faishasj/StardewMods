@@ -27,6 +27,20 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
     ** Fields
     *********/
     /****
+    ** Constants
+    ****/
+    private const int EditButtonId = 1_200_000;
+    private const int EditNameFieldId = EditButtonId + 1;
+    private const int EditCategoryFieldId = EditButtonId + 2;
+    private const int EditOrderFieldId = EditButtonId + 3;
+    private const int EditHideChestFieldId = EditButtonId + 4;
+    private const int EditAutomateStoreId = EditButtonId + 5;
+    private const int EditAutomateTakeId = EditButtonId + 6;
+    private const int EditSaveButtonId = EditButtonId + 7;
+    private const int EditResetButtonId = EditButtonId + 8;
+    private const int EditExitButtonId = EditButtonId + 9;
+
+    /****
     ** Data
     ****/
     /// <summary>The available chests.</summary>
@@ -59,6 +73,20 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
     /// <summary>The keybind for escaping the active element or menu.</summary>
     private readonly KeybindList EscapeKeybind = KeybindList.Parse($"{SButton.Escape}, {SButton.ControllerB}");
 
+    /// <summary>The controller inputs which should be handled by the active menu's snappy-menu navigation.</summary>
+    private readonly HashSet<SButton> ControllerNavigationButtons =
+    [
+        SButton.DPadUp,
+        SButton.DPadDown,
+        SButton.DPadLeft,
+        SButton.DPadRight,
+        SButton.LeftThumbstickUp,
+        SButton.LeftThumbstickDown,
+        SButton.LeftThumbstickLeft,
+        SButton.LeftThumbstickRight,
+        SButton.ControllerA
+    ];
+
     /****
     ** Menu management
     ****/
@@ -82,6 +110,21 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
 
     /// <summary>The edit button.</summary>
     protected ClickableTextureComponent EditButton;
+
+    /// <summary>The underlying menu component linked to the edit button for controller navigation.</summary>
+    private ClickableComponent? EditButtonAnchor;
+
+    /// <summary>The anchor's original upward neighbor ID.</summary>
+    private int EditButtonAnchorOriginalUpId;
+
+    /// <summary>Whether the controller component graph needs to be rebuilt after drawing.</summary>
+    private bool ControllerFlowNeedsRefresh = true;
+
+    /// <summary>The component to focus after rebuilding the controller component graph.</summary>
+    private ClickableComponent? PendingControllerFocus;
+
+    /// <summary>The components currently injected into the underlying menu's controller graph.</summary>
+    private readonly List<ClickableComponent> ControllerComponents = [];
 
     /****
     ** Edit UI
@@ -112,6 +155,24 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
 
     /// <summary>The top-right button which closes the edit form.</summary>
     private ClickableTextureComponent EditExitButton;
+
+    /// <summary>The controller-selectable area for the chest name field.</summary>
+    private ClickableComponent EditNameFieldArea;
+
+    /// <summary>The controller-selectable area for the category field.</summary>
+    private ClickableComponent EditCategoryFieldArea;
+
+    /// <summary>The controller-selectable area for the order field.</summary>
+    private ClickableComponent EditOrderFieldArea;
+
+    /// <summary>The controller-selectable area for the hide-chest checkbox.</summary>
+    private ClickableComponent EditHideChestFieldArea;
+
+    /// <summary>The controller-selectable area for the Automate storage dropdown.</summary>
+    private ClickableComponent? EditAutomateStoreArea;
+
+    /// <summary>The controller-selectable area for the Automate take dropdown.</summary>
+    private ClickableComponent? EditAutomateTakeArea;
 
     /// <summary>The textboxes managed by Chests Anywhere.</summary>
     private IEnumerable<ValidatedTextBox> ManagedTextboxes => [this.EditNameField, this.EditOrderField, this.EditCategoryField];
@@ -176,6 +237,10 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
     /// <inheritdoc cref="IStorageOverlay.Dispose" />
     public override void Dispose()
     {
+        this.RemoveControllerComponents();
+        if (Game1.activeClickableMenu == this.Menu)
+            this.Menu.populateClickableComponentList();
+
         this.OnAutomateOptionsChanged = null;
         this.OnChestSelected = null;
         base.Dispose();
@@ -321,6 +386,8 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
             this.EditExitButton.draw(batch);
         }
 
+        this.UpdateControllerFlow();
+
         // cursor
         this.DrawCursor();
     }
@@ -383,6 +450,12 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
                 if (this.EscapeKeybind.JustPressed())
                     this.ActiveElement = Element.Menu;
 
+                if (this.ActiveElement == Element.EditForm && this.TryNavigateExpandedEditDropdown(e.Pressed))
+                {
+                    this.SuppressAll(e.Pressed);
+                    break;
+                }
+
                 // always suppress in this context, since we'll handle text input ourselves
                 if (e.Pressed.Any())
                 {
@@ -396,7 +469,11 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
                             dispatcher.Subscriber.RecieveTextInput(Regex.Replace(text, @"[\r\n]", ""));
                     }
 
-                    this.SuppressAll(e.Pressed.Except(this.PasteModifierKeys));
+                    IEnumerable<SButton> buttonsToSuppress = e.Pressed.Except(this.PasteModifierKeys);
+                    if (this.ActiveElement == Element.EditForm)
+                        buttonsToSuppress = buttonsToSuppress.Except(this.ControllerNavigationButtons);
+
+                    this.SuppressAll(buttonsToSuppress);
                 }
 
                 break;
@@ -608,10 +685,17 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
         nameof(BaseChestOverlay.EditHideChestField),
         nameof(BaseChestOverlay.EditSaveButtonArea),
         nameof(BaseChestOverlay.EditResetButtonArea),
-        nameof(BaseChestOverlay.EditExitButton)
+        nameof(BaseChestOverlay.EditExitButton),
+        nameof(BaseChestOverlay.EditNameFieldArea),
+        nameof(BaseChestOverlay.EditCategoryFieldArea),
+        nameof(BaseChestOverlay.EditOrderFieldArea),
+        nameof(BaseChestOverlay.EditHideChestFieldArea)
     )]
     private void ReinitializeBaseComponents()
     {
+        bool editButtonWasFocused = this.ControllerComponents.Contains(this.Menu.currentlySnappedComponent);
+        this.RemoveControllerComponents();
+
         int topOffset = this.GetTopOffset(this.Menu);
 
         Rectangle bounds = new Rectangle(this.Menu.xPositionOnScreen, this.Menu.yPositionOnScreen, this.Menu.width, this.Menu.height);
@@ -656,7 +740,10 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
                 : new Point(0, bounds.Y + topOffset);
 
             Rectangle buttonBounds = new Rectangle(iconPos.X, iconPos.Y, (int)(sprite.Width * zoom), (int)(sprite.Height * zoom));
-            this.EditButton = new ClickableTextureComponent("edit-chest", buttonBounds, null, I18n.Button_EditChest(), CommonSprites.Icons.Sheet, sprite, zoom);
+            this.EditButton = new ClickableTextureComponent("edit-chest", buttonBounds, null, I18n.Button_EditChest(), CommonSprites.Icons.Sheet, sprite, zoom)
+            {
+                myID = EditButtonId
+            };
         }
 
         // edit form
@@ -696,9 +783,27 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
 
         this.FillForm();
 
-        this.EditSaveButtonArea = new ClickableComponent(new Rectangle(0, 0, Game1.tileSize, Game1.tileSize), "save-chest");
-        this.EditResetButtonArea = new ClickableComponent(new Rectangle(0, 0, Game1.tileSize, Game1.tileSize), "reset-chest");
-        this.EditExitButton = new ClickableTextureComponent(new Rectangle(bounds.Right - 9 * Game1.pixelZoom, bounds.Y - Game1.pixelZoom * 2, CommonSprites.Icons.ExitButton.Width * Game1.pixelZoom, CommonSprites.Icons.ExitButton.Height * Game1.pixelZoom), CommonSprites.Icons.Sheet, CommonSprites.Icons.ExitButton, Game1.pixelZoom);
+        this.EditNameFieldArea = this.CreateControllerComponent(EditNameFieldId, "edit-name", I18n.Label_Name());
+        this.EditCategoryFieldArea = this.CreateControllerComponent(EditCategoryFieldId, "edit-category", I18n.Label_Category());
+        this.EditOrderFieldArea = this.CreateControllerComponent(EditOrderFieldId, "edit-order", I18n.Label_Order());
+        this.EditHideChestFieldArea = this.CreateControllerComponent(EditHideChestFieldId, "edit-hide", I18n.Label_HideChest());
+        this.EditAutomateStoreArea = this.EditAutomateStore != null
+            ? this.CreateControllerComponent(EditAutomateStoreId, "edit-automate-store", I18n.Label_AutomateStore())
+            : null;
+        this.EditAutomateTakeArea = this.EditAutomateTake != null
+            ? this.CreateControllerComponent(EditAutomateTakeId, "edit-automate-take", I18n.Label_AutomateTake())
+            : null;
+        this.EditSaveButtonArea = this.CreateControllerComponent(EditSaveButtonId, "save-chest", I18n.Button_Save());
+        this.EditResetButtonArea = this.CreateControllerComponent(EditResetButtonId, "reset-chest", I18n.Button_Reset());
+        this.EditExitButton = new ClickableTextureComponent(new Rectangle(bounds.Right - 9 * Game1.pixelZoom, bounds.Y - Game1.pixelZoom * 2, CommonSprites.Icons.ExitButton.Width * Game1.pixelZoom, CommonSprites.Icons.ExitButton.Height * Game1.pixelZoom), CommonSprites.Icons.Sheet, CommonSprites.Icons.ExitButton, Game1.pixelZoom)
+        {
+            myID = EditExitButtonId
+        };
+
+        this.ControllerFlowNeedsRefresh = true;
+        this.PendingControllerFocus = this.ActiveElement == Element.EditForm
+            ? this.EditNameFieldArea
+            : editButtonWasFocused ? this.EditButton : null;
     }
 
     /// <summary>Initialize the edit-chest overlay for rendering.</summary>
@@ -778,6 +883,11 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
         // deselect textboxes
         if (value != Element.EditForm)
             this.DeselectManagedTextboxes();
+
+        this.ControllerFlowNeedsRefresh = true;
+        this.PendingControllerFocus = value == Element.EditForm
+            ? this.EditNameFieldArea
+            : this.EditButton;
     }
 
     /// <summary>Exit the chest menu.</summary>
@@ -888,6 +998,181 @@ internal abstract class BaseChestOverlay : BaseOverlay, IStorageOverlay
     {
         foreach (ValidatedTextBox textbox in this.ManagedTextboxes)
             textbox.Selected = false;
+    }
+
+    /// <summary>Create a component used for controller navigation.</summary>
+    private ClickableComponent CreateControllerComponent(int id, string name, string screenReaderText)
+    {
+        return new ClickableComponent(Rectangle.Empty, name)
+        {
+            myID = id,
+            ScreenReaderText = screenReaderText
+        };
+    }
+
+    /// <summary>Update the underlying menu's controller graph for the current overlay state.</summary>
+    private void UpdateControllerFlow()
+    {
+        if (!Game1.options.SnappyMenus || !Game1.options.gamepadControls)
+            return;
+
+        this.UpdateEditFormControllerBounds();
+
+        bool expectedComponentPresent = this.ActiveElement == Element.EditForm
+            ? this.Menu.allClickableComponents?.Contains(this.EditNameFieldArea) is true
+            : this.Menu.allClickableComponents?.Contains(this.EditButton) is true;
+        if (!this.ControllerFlowNeedsRefresh && expectedComponentPresent)
+            return;
+
+        this.RestoreEditButtonAnchor();
+        this.ControllerComponents.Clear();
+
+        if (this.ActiveElement == Element.EditForm)
+            this.InstallEditFormControllerFlow();
+        else
+            this.InstallMenuControllerFlow();
+
+        if (this.PendingControllerFocus != null)
+        {
+            this.Menu.currentlySnappedComponent = this.PendingControllerFocus;
+            this.Menu.snapCursorToCurrentSnappedComponent();
+        }
+
+        this.PendingControllerFocus = null;
+        this.ControllerFlowNeedsRefresh = false;
+    }
+
+    /// <summary>Add the edit button to the underlying menu's controller graph.</summary>
+    private void InstallMenuControllerFlow()
+    {
+        this.Menu.populateClickableComponentList();
+        this.Menu.allClickableComponents ??= [];
+
+        Point editCenter = this.EditButton.bounds.Center;
+        this.EditButtonAnchor = this.Menu.allClickableComponents
+            .Where(component => component.myID >= 0 && component != this.EditButton)
+            .OrderBy(component =>
+            {
+                Point center = component.bounds.Center;
+                int abovePenalty = center.Y < editCenter.Y ? 1_000_000 : 0;
+                return abovePenalty + Math.Abs(center.X - editCenter.X) + Math.Abs(center.Y - editCenter.Y);
+            })
+            .FirstOrDefault();
+
+        this.EditButton.upNeighborID = -1;
+        this.EditButton.leftNeighborID = -1;
+        this.EditButton.rightNeighborID = -1;
+        this.EditButton.downNeighborID = this.EditButtonAnchor?.myID ?? -1;
+
+        if (this.EditButtonAnchor != null)
+        {
+            this.EditButtonAnchorOriginalUpId = this.EditButtonAnchor.upNeighborID;
+            this.EditButtonAnchor.upNeighborID = EditButtonId;
+        }
+
+        this.ControllerComponents.Add(this.EditButton);
+        this.Menu.allClickableComponents.Add(this.EditButton);
+    }
+
+    /// <summary>Replace the underlying menu's controller graph with the edit form controls.</summary>
+    private void InstallEditFormControllerFlow()
+    {
+        List<ClickableComponent> verticalComponents =
+        [
+            this.EditNameFieldArea,
+            this.EditCategoryFieldArea,
+            this.EditOrderFieldArea,
+            this.EditHideChestFieldArea
+        ];
+        if (this.EditAutomateStoreArea != null)
+            verticalComponents.Add(this.EditAutomateStoreArea);
+        if (this.EditAutomateTakeArea != null)
+            verticalComponents.Add(this.EditAutomateTakeArea);
+
+        for (int i = 0; i < verticalComponents.Count; i++)
+        {
+            ClickableComponent component = verticalComponents[i];
+            component.upNeighborID = i > 0 ? verticalComponents[i - 1].myID : EditExitButtonId;
+            component.downNeighborID = i + 1 < verticalComponents.Count ? verticalComponents[i + 1].myID : EditSaveButtonId;
+            component.leftNeighborID = -1;
+            component.rightNeighborID = -1;
+        }
+
+        int lastFieldId = verticalComponents[^1].myID;
+        this.EditSaveButtonArea.upNeighborID = lastFieldId;
+        this.EditSaveButtonArea.downNeighborID = EditExitButtonId;
+        this.EditSaveButtonArea.leftNeighborID = -1;
+        this.EditSaveButtonArea.rightNeighborID = EditResetButtonId;
+
+        this.EditResetButtonArea.upNeighborID = lastFieldId;
+        this.EditResetButtonArea.downNeighborID = EditExitButtonId;
+        this.EditResetButtonArea.leftNeighborID = EditSaveButtonId;
+        this.EditResetButtonArea.rightNeighborID = -1;
+
+        this.EditExitButton.upNeighborID = EditResetButtonId;
+        this.EditExitButton.downNeighborID = EditNameFieldId;
+        this.EditExitButton.leftNeighborID = EditResetButtonId;
+        this.EditExitButton.rightNeighborID = -1;
+
+        this.ControllerComponents.AddRange(verticalComponents);
+        this.ControllerComponents.Add(this.EditSaveButtonArea);
+        this.ControllerComponents.Add(this.EditResetButtonArea);
+        this.ControllerComponents.Add(this.EditExitButton);
+        this.Menu.allClickableComponents = [.. this.ControllerComponents];
+    }
+
+    /// <summary>Update controller component bounds to match the rendered edit controls.</summary>
+    private void UpdateEditFormControllerBounds()
+    {
+        this.EditNameFieldArea.bounds = this.EditNameField.GetBounds();
+        this.EditCategoryFieldArea.bounds = this.EditCategoryField.GetBounds();
+        this.EditOrderFieldArea.bounds = this.EditOrderField.GetBounds();
+        this.EditHideChestFieldArea.bounds = this.EditHideChestField.GetBounds();
+
+        if (this.EditAutomateStoreArea != null && this.EditAutomateStore != null)
+            this.EditAutomateStoreArea.bounds = this.EditAutomateStore.Bounds;
+        if (this.EditAutomateTakeArea != null && this.EditAutomateTake != null)
+            this.EditAutomateTakeArea.bounds = this.EditAutomateTake.Bounds;
+    }
+
+    /// <summary>Remove controller components injected into the underlying menu.</summary>
+    private void RemoveControllerComponents()
+    {
+        this.RestoreEditButtonAnchor();
+
+        if (this.Menu.allClickableComponents != null)
+        {
+            foreach (ClickableComponent component in this.ControllerComponents)
+                this.Menu.allClickableComponents.Remove(component);
+        }
+
+        this.ControllerComponents.Clear();
+    }
+
+    /// <summary>Restore the menu component linked to the edit button.</summary>
+    private void RestoreEditButtonAnchor()
+    {
+        if (this.EditButtonAnchor != null)
+        {
+            this.EditButtonAnchor.upNeighborID = this.EditButtonAnchorOriginalUpId;
+            this.EditButtonAnchor = null;
+        }
+    }
+
+    /// <summary>Handle directional controller input for an expanded edit-form dropdown.</summary>
+    private bool TryNavigateExpandedEditDropdown(IEnumerable<SButton> pressedButtons)
+    {
+        int offset = 0;
+        foreach (SButton button in pressedButtons)
+        {
+            if (button is SButton.DPadUp or SButton.DPadLeft or SButton.LeftThumbstickUp or SButton.LeftThumbstickLeft)
+                offset = -1;
+            else if (button is SButton.DPadDown or SButton.DPadRight or SButton.LeftThumbstickDown or SButton.LeftThumbstickRight)
+                offset = 1;
+        }
+
+        return offset != 0
+            && (this.EditAutomateStore?.TryMoveSelection(offset) is true || this.EditAutomateTake?.TryMoveSelection(offset) is true);
     }
 
     /// <summary>Draw a checkbox to the screen, including any position updates needed.</summary>
